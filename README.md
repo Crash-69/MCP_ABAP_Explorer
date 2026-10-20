@@ -107,20 +107,7 @@ Il server ascolta solo su loopback; le POST richiedono token di sessione e Host 
 
 Estratte il 19 ottobre 2026 da `LAUNCHER_DASHBOARD/launcher_dashboard.py`:
 
-| Applicazione | Porta |
-| --- | --- |
-| Inlay Studio | 3002 |
-| Jarvis2 | 8008 |
-| SecureVault | 8011 |
-| Estrattore PDF AI | 8020 |
-| Diagnostics Uniemens | 8021 |
-| Monitoraggio Estrazione CF | 8022 |
-| Word in Markdown | 8027 |
-| Compila Word | 8030 |
-| TxtToObsidian | 8035 |
-| Trascrizioni YouTube | 8501 |
-| Word in Mermaid | 8502 |
-| Launcher Dashboard | 8040-8049 riservate |
+
 
 Verifica Cedolino e desktop senza porta HTTP. Inlay puo ridefinire porta/URL tramite metadata locale. L'API runtime del launcher su 8040 non ha risposto entro 5 secondi: la tabella descrive le porte configurate, non garantisce quelle runtime di Inlay. Il controllo TCP tra 8000 e 8999 ha rilevato listener su 8040 e 8053. **8036** era libera e non registrata ed e la porta assegnata a questa app.
 
