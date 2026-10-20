@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="app-token" content="__TOKEN__">
+  <title>MCP_ABAP_Explorer</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/lucide.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><div class="brand"><i data-lucide="network"></i><strong>MCP_ABAP_Explorer</strong></div><span id="health" role="status">Avvio...</span></header>
+  <main>
+    <header class="heading"><h1>Esplora la documentazione SAP ABAP</h1><span class="local"><i data-lucide="lock-keyhole"></i>Sessione locale</span></header>
+    <form id="search-form">
+      <section><h2>01 <span>Strumento MCP</span></h2>
+        <fieldset class="mode-field"><legend>Modalita di esecuzione</legend><div class="segmented"><label><input type="radio" name="mode" value="python" checked>Python diretto</label><label><input type="radio" name="mode" value="llm">Ollama locale</label></div></fieldset>
+        <div id="llm-settings" class="tool-field" hidden><label class="field-label" for="model">Modello Ollama con tool-calling</label><div class="model-row"><select id="model" name="model"><option value="">Nessun modello caricato</option></select><button id="refresh-models" class="icon-button" type="button" title="Aggiorna modelli Ollama" aria-label="Aggiorna modelli Ollama"><i data-lucide="refresh-cw"></i></button></div><span id="model-status" role="status"></span></div>
+        <div id="python-tool-field" class="tool-field"><label class="field-label" for="tool">Strumento</label><select id="tool" name="tool" aria-describedby="tool-name">
+          <option value="search">Cerca Documentazione</option>
+          <option value="fetch">Recupera Documento Completo</option>
+          <option value="abap_lint">Analisi Statica Codice</option>
+          <option value="abap_feature_matrix">Matrice Funzionalita ABAP</option>
+          <option value="sap_community_search">Cerca nella SAP Community</option>
+          <option value="sap_search_objects">Cerca Oggetti Rilasciati SAP</option>
+          <option value="sap_get_object_details">Dettagli Oggetti Rilasciati</option>
+          <option value="sap_discovery_center_search">Cerca Servizi SAP BTP</option>
+          <option value="sap_discovery_center_service">Dettagli Servizio SAP BTP</option>
+        </select><span id="tool-name">search</span></div>
+        <label id="input-label" class="field-label" for="query">Stringa di ricerca</label>
+        <textarea id="query" name="query" rows="3" maxlength="4000" required placeholder="SELECT statements in ABAP Cloud"></textarea>
+        <div class="actionbar"><div id="count-field" class="count-field"><label class="field-label" for="count">Numero di risultati</label><input id="count" type="number" value="3" min="1" max="20" step="1" required></div><button id="search" type="submit" disabled><i data-lucide="send"></i><span>Interroga Server MCP</span></button></div>
+      </section>
+    </form>
+    <div id="error" role="alert" hidden></div>
+    <section id="result" class="settings" aria-busy="false">
+      <div class="result-heading"><h2>02 <span>Risposta del server</span></h2><span id="stats" role="status">Nessuna ricerca eseguita</span></div>
+      <label id="preview-label" class="field-label" for="preview">Anteprima content.text</label>
+      <textarea id="preview" rows="13" readonly spellcheck="false" placeholder="In attesa della risposta..." aria-label="Anteprima content.text"></textarea>
+      <details id="mcp-raw-panel" hidden><summary>Risposte MCP originali</summary><textarea id="mcp-raw" rows="9" readonly spellcheck="false" aria-label="Risposte MCP originali"></textarea></details>
+      <p id="search-log" role="status" hidden></p>
+    </section>
+    <section class="export-section"><h2>03 <span>Esportazione</span></h2>
+      <div class="settings-grid"><fieldset><legend>Formato del file</legend><div class="segmented"><label><input type="radio" name="format" value="json" checked>JSON</label><label><input type="radio" name="format" value="txt">Testo (.txt)</label><label><input type="radio" name="format" value="md">Markdown (.md)</label></div></fieldset><div class="destination"><span class="field-label">Cartella di salvataggio</span><span>C:\Progetto_AI\MCP_ABAP_Explorer</span></div></div>
+      <div class="actionbar"><span id="export-status" role="status">Nessuna risposta selezionata</span><button id="export" type="button" disabled><i data-lucide="save"></i><span>Esporta Risposta</span></button></div>
+      <div id="success" role="status" hidden><div class="saved-heading"><strong><i data-lucide="shield-check"></i><span id="validation"></span></strong><a id="download" class="text-button" download><i data-lucide="download"></i>Scarica file</a></div><p id="saved-path"></p><small id="detected-note"></small></div>
+    </section>
+  </main>
+  <footer><a href="https://mcp-abap.marianzeis.de/mcp" target="_blank" rel="noopener noreferrer">SAP ABAP MCP</a><span>/</span>Magika<span>/</span><span id="port-info">127.0.0.1:8036</span></footer>
+</body>
+</html>
