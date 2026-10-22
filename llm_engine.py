@@ -10,7 +10,11 @@ import anyio
 import httpx
 from jsonschema import Draft202012Validator
 
-from mcp_engine import ENDPOINT, MAX_CODE_BYTES, MAX_CONTENT, TOOLS, ExplorerError, connected_session
+from mcp_engine import ENDPOINT, MAX_CODE_BYTES, MAX_CONTENT, TOOLS, ExplorerError
+from mcp_providers import IMcpProvider, McpProviderError, create_provider
+from typing import Callable
+
+ProviderFactory = Callable[[str | None], IMcpProvider]
 
 OLLAMA_URL = 'http://127.0.0.1:11434'
 MAX_TOOL_CALLS = 4
@@ -62,30 +66,23 @@ async def list_local_models() -> list[dict]:
         raise ExplorerError('Ollama locale non disponibile o catalogo non valido su 127.0.0.1:11434.') from error
 
 
-async def mcp_catalog() -> dict:
-    tools = {}
-    async with connected_session() as session:
-        cursor = None
-        while True:
-            page = await session.list_tools(cursor=cursor)
-            for tool in page.tools:
-                if tool.name in TOOLS:
-                    tools[tool.name] = tool
-            cursor = page.nextCursor
-            if not cursor:
-                break
+async def mcp_catalog(server_id: str | None = None, provider_factory: ProviderFactory | None = None) -> dict:
+    provider = (provider_factory or create_provider)(server_id)
+    tools = await provider.discover_tools()
+    if not provider.allow_dynamic_tools:
+        tools = {name: tool for name, tool in tools.items() if name in TOOLS}
     if not tools:
-        raise ExplorerError('Il server MCP non espone strumenti autorizzati.')
+        raise ExplorerError('Il server MCP selezionato non espone strumenti disponibili.')
     return tools
 
 
-def validate_call(name: str, arguments: dict, catalog: dict) -> None:
-    if not isinstance(name, str) or name not in catalog or name not in TOOLS:
+def validate_call(name: str, arguments: dict, catalog: dict, strict_properties: bool = True) -> None:
+    if not isinstance(name, str) or name not in catalog:
         raise ExplorerError('Il modello ha richiesto un tool non autorizzato.')
     if not isinstance(arguments, dict):
         raise ExplorerError('Gli argomenti del modello non sono un oggetto JSON.')
     schema = catalog[name].inputSchema
-    if set(arguments) - set(schema.get('properties', {})):
+    if strict_properties and set(arguments) - set(schema.get('properties', {})):
         raise ExplorerError(f'Parametri sconosciuti generati dal modello per {name}.')
     if not Draft202012Validator(schema).is_valid(arguments):
         raise ExplorerError(f'Argomenti del modello non conformi allo schema MCP di {name}.')
@@ -131,13 +128,15 @@ def text_tool_calls(content: str) -> list[dict]:
     return calls
 
 
-async def run_local_llm(model: str, prompt: str) -> dict:
+async def run_local_llm(
+    model: str, prompt: str, server_id: str | None = None,
+    provider_factory: ProviderFactory | None = None,
+) -> dict:
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
         raise ExplorerError('Inserisci una richiesta da 1 a 12000 caratteri.')
     if not isinstance(model, str) or not model:
         raise ExplorerError('Seleziona un modello locale compatibile con i tool.')
     trace = []
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
     seen = set()
     try:
         with anyio.fail_after(LLM_TIMEOUT):
@@ -148,7 +147,17 @@ async def run_local_llm(model: str, prompt: str) -> dict:
                 selected = next((item for item in models if item['name'] == model), None)
                 if selected is None:
                     raise ExplorerError('Il modello non e installato localmente o non dichiara il supporto tools.')
-                catalog = await mcp_catalog()
+                provider = (provider_factory or create_provider)(server_id)
+                system_prompt = SYSTEM_PROMPT
+                if provider.allow_dynamic_tools:
+                    system_prompt += (
+                        ' Stai usando un server SAP On-Premise: usa il server selezionato come unica fonte '
+                        'di verita. Prima di rispondere interroga i tool runtime pertinenti; non inventare '
+                        'metadati DDIC, CDS, classi, function module o campi. Distingui dati SAP runtime '
+                        'da raccomandazioni generate.'
+                    )
+                messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': prompt}]
+                catalog = await mcp_catalog(provider.server_id, provider_factory)
                 explicit = {name: tool for name, tool in catalog.items()
                             if re.search(rf'\b{re.escape(name)}\b', prompt, re.IGNORECASE)}
                 if explicit:
@@ -191,7 +200,8 @@ async def run_local_llm(model: str, prompt: str) -> dict:
                         snapshot = {
                             'mode': 'llm', 'model': model, 'provider': 'Ollama locale',
                             'tool': 'llm', 'arguments': {}, 'query': prompt, 'original_query': prompt,
-                            'endpoint': ENDPOINT, 'created_at': datetime.now(timezone.utc).isoformat(),
+                            'endpoint': getattr(provider, 'endpoint', f'stdio:{provider.server_id}'),
+                            'server_id': provider.server_id, 'created_at': datetime.now(timezone.utc).isoformat(),
                             'raw_text': content, 'response': {'answer': content, 'tool_calls': trace},
                             'mcp_raw_text': '\n\n'.join(f"--- {item['name']} ---\n{item['raw_text']}" for item in trace),
                             'search_log': [f'Modello locale: {model}'] + [
@@ -213,13 +223,15 @@ async def run_local_llm(model: str, prompt: str) -> dict:
                                 arguments = json.loads(arguments)
                             except ValueError as error:
                                 raise ExplorerError('Il modello ha generato argomenti JSON non validi.') from error
-                        validate_call(name, arguments, catalog)
+                        validate_call(name, arguments, catalog, strict_properties=not provider.allow_dynamic_tools)
                         signature = (name, json.dumps(arguments, sort_keys=True))
                         if signature in seen:
                             raise ExplorerError('Rilevato un ciclo: il modello ripete la stessa chiamata MCP.')
                         seen.add(signature)
-                        async with connected_session() as session:
-                            result = await session.call_tool(name=name, arguments=arguments)
+                        result = await provider.execute_tool(name=name, arguments=arguments)
+                        if result.isError and provider.allow_dynamic_tools:
+                            raw_error = '\n\n'.join(item.text for item in result.content if item.type == 'text')
+                            raise ExplorerError(raw_error[:2000] or f'Il server SAP ha rifiutato il tool {name}.')
                         raw = '\n\n'.join(item.text for item in result.content if item.type == 'text')
                         serialized = result.model_dump(mode='json')
                         feedback = json.dumps({'isError': result.isError, 'response': serialized}, ensure_ascii=False)
@@ -240,6 +252,8 @@ async def run_local_llm(model: str, prompt: str) -> dict:
                 raise ExplorerError('Il modello non ha concluso entro il limite di iterazioni.')
     except ExplorerError:
         raise
+    except McpProviderError as error:
+        raise ExplorerError(str(error)) from error
     except TimeoutError as error:
         raise ExplorerError('Tempo massimo LLM superato (300 secondi). Prova un modello piu piccolo.') from error
     except httpx.TimeoutException as error:

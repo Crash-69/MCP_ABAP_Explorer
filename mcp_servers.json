@@ -1,0 +1,30 @@
+{
+  "default_server": "sap-cloud",
+  "servers": {
+    "sap-cloud": {
+      "label": "SAP Cloud",
+      "transport": "streamable_http",
+      "endpoint": "${SAP_CLOUD_MCP_ENDPOINT:-https://mcp-abap.marianzeis.de/mcp}"
+    },
+    "sap-on-premise": {
+      "label": "SAP On-Premise",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "mcp-abap-adt"],
+      "connection_defaults": {
+        "SAP_URL": "https://vhsrqds4ci.sap.campania.local",
+        "SAP_SYSNR": "00",
+        "SAP_SYSTEM_ID": "DS4",
+        "SAP_CLIENT": "100"
+      },
+      "env": {
+        "SAP_URL": "${SAP_URL}",
+        "SAP_SYSNR": "${SAP_SYSNR}",
+        "SAP_SYSTEM_ID": "${SAP_SYSTEM_ID}",
+        "SAP_CLIENT": "${SAP_CLIENT}",
+        "SAP_USERNAME": "${SAP_USERNAME}",
+        "SAP_PASSWORD": "${SAP_PASSWORD}"
+      }
+    }
+  }
+}

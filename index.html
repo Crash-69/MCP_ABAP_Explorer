@@ -14,8 +14,28 @@
   <header class="topbar"><div class="brand"><i data-lucide="network"></i><strong>MCP_ABAP_Explorer</strong></div><span id="health" role="status">Avvio...</span></header>
   <main>
     <header class="heading"><h1>Esplora la documentazione SAP ABAP</h1><span class="local"><i data-lucide="lock-keyhole"></i>Sessione locale</span></header>
-    <form id="search-form">
+    <form id="search-form" autocomplete="off">
       <section><h2>01 <span>Strumento MCP</span></h2>
+        <div class="tool-field"><label class="field-label" for="server">Server SAP</label><select id="server" name="server_id" aria-label="Server MCP SAP"></select></div>
+        <div id="adt-connection" class="tool-field" hidden>
+          <label class="field-label" for="adt-url">Connessione SAP On-Premise</label>
+          <div class="adt-fields">
+            <label>URL SAP<input id="adt-url" type="url" maxlength="512" autocomplete="off" placeholder="https://sap.example.local"></label>
+            <label>Numero istanza<input id="adt-sysnr" type="text" inputmode="numeric" maxlength="2" autocomplete="off" placeholder="00"></label>
+            <label>ID sistema<input id="adt-system-id" type="text" maxlength="3" autocomplete="off" autocapitalize="characters" placeholder="DS4"></label>
+            <label>Client<input id="adt-client" type="text" inputmode="numeric" maxlength="3" autocomplete="off"></label>
+            <label>USER SAP<input id="adt-user" type="text" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+            <label>Password<input id="adt-password" type="password" autocomplete="off" spellcheck="false"></label>
+          </div>
+          <button id="refresh-adt-tools" type="button" title="Collega ADT e aggiorna la lista dei tool"><i data-lucide="refresh-cw"></i><span>Aggiorna tool ADT</span></button>
+          <span id="adt-status" role="status"></span>
+          <section id="sap-diagnostics" class="diagnostics" aria-labelledby="diagnostics-title">
+            <h3 id="diagnostics-title">SAP On-Premise Diagnostics</h3>
+            <div class="diagnostics-actions"><button id="run-diagnostics" type="button"><i data-lucide="activity"></i><span>Esegui diagnostica</span></button><button id="download-diagnostics" type="button" disabled><i data-lucide="download"></i><span>Scarica report JSON</span></button></div>
+            <p id="diagnostics-summary" role="status">Diagnostica non ancora eseguita</p>
+            <div id="diagnostics-results" class="diagnostics-results" aria-live="polite"></div>
+          </section>
+        </div>
         <fieldset class="mode-field"><legend>Modalita di esecuzione</legend><div class="segmented"><label><input type="radio" name="mode" value="python" checked>Python diretto</label><label><input type="radio" name="mode" value="llm">Ollama locale</label></div></fieldset>
         <div id="llm-settings" class="tool-field" hidden><label class="field-label" for="model">Modello Ollama con tool-calling</label><div class="model-row"><select id="model" name="model"><option value="">Nessun modello caricato</option></select><button id="refresh-models" class="icon-button" type="button" title="Aggiorna modelli Ollama" aria-label="Aggiorna modelli Ollama"><i data-lucide="refresh-cw"></i></button></div><span id="model-status" role="status"></span></div>
         <div id="python-tool-field" class="tool-field"><label class="field-label" for="tool">Strumento</label><select id="tool" name="tool" aria-describedby="tool-name">
@@ -29,6 +49,7 @@
           <option value="sap_discovery_center_search">Cerca Servizi SAP BTP</option>
           <option value="sap_discovery_center_service">Dettagli Servizio SAP BTP</option>
         </select><span id="tool-name">search</span></div>
+        <div id="system-type-field" class="tool-field" hidden><label class="field-label" for="system-type">Sistema SAP di destinazione</label><select id="system-type" name="system_type"><option value="public_cloud">SAP S/4HANA Cloud Public</option><option value="btp">SAP BTP ABAP Environment</option><option value="private_cloud">SAP S/4HANA Cloud Private</option><option value="on_premise">SAP On-Premise</option></select></div>
         <label id="input-label" class="field-label" for="query">Stringa di ricerca</label>
         <textarea id="query" name="query" rows="3" maxlength="4000" required placeholder="SELECT statements in ABAP Cloud"></textarea>
         <div class="actionbar"><div id="count-field" class="count-field"><label class="field-label" for="count">Numero di risultati</label><input id="count" type="number" value="3" min="1" max="20" step="1" required></div><button id="search" type="submit" disabled><i data-lucide="send"></i><span>Interroga Server MCP</span></button></div>

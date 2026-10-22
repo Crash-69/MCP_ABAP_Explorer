@@ -1,4 +1,6 @@
 import json
+import os
+import ssl
 import tempfile
 import threading
 import unittest
@@ -15,6 +17,8 @@ from mcp.types import CallToolResult, TextContent
 
 import app
 import llm_engine
+import mcp_providers
+import sap_diagnostics
 from mcp_engine import ExplorerError, export_response, format_response, invoke_tool, query_candidates, result_quality, sanitize_query, search, tool_arguments
 
 
@@ -78,14 +82,10 @@ class SearchTests(unittest.TestCase):
         call_tool = AsyncMock(side_effect=results)
 
         @asynccontextmanager
-        async def transport(*args, **kwargs):
-            yield None, None, None
-
-        @asynccontextmanager
         async def session(*args, **kwargs):
             yield SimpleNamespace(initialize=AsyncMock(), call_tool=call_tool)
 
-        with patch('mcp_engine.streamable_http_client', transport), patch('mcp_engine.ClientSession', session):
+        with patch('mcp_engine.connected_session', session):
             snapshot = anyio.run(search, query, 3)
         return snapshot, call_tool
 
@@ -187,15 +187,27 @@ class SearchTests(unittest.TestCase):
 class ToolTests(unittest.TestCase):
     def test_argument_mapping(self):
         for tool in ('search', 'sap_community_search', 'sap_search_objects', 'abap_feature_matrix', 'sap_discovery_center_search'):
-            self.assertEqual(tool_arguments(tool, '  SAP topic  '), {'query': 'SAP topic'})
+            expected = {'query': 'SAP topic'}
+            if tool == 'sap_search_objects':
+                expected['system_type'] = 'public_cloud'
+            self.assertEqual(tool_arguments(tool, '  SAP topic  '), expected)
         for tool in ('abap_feature_matrix', 'sap_search_objects'):
-            self.assertEqual(tool_arguments(tool, ''), {'query': ''})
+            expected = {'query': ''}
+            if tool == 'sap_search_objects':
+                expected['system_type'] = 'public_cloud'
+            self.assertEqual(tool_arguments(tool, ''), expected)
         self.assertEqual(tool_arguments('fetch', ' /library/document_id '), {'id': '/library/document_id'})
         self.assertEqual(tool_arguments('sap_discovery_center_service', ' service-uuid '), {'serviceId': 'service-uuid'})
         code = '\nREPORT z_demo.\nWRITE: / "quoted", / \'@search\'.\n'
         self.assertEqual(tool_arguments('abap_lint', code), {'code': code})
         self.assertEqual(tool_arguments('sap_get_object_details', ' CLAS, CL_ABAP_REGEX '), {
-            'object_type': 'CLAS', 'object_name': 'CL_ABAP_REGEX',
+            'object_type': 'CLAS', 'object_name': 'CL_ABAP_REGEX', 'system_type': 'public_cloud',
+        })
+        self.assertEqual(tool_arguments('sap_get_object_details', 'FUNC, "BAPI_EMPLOYEE_GETLIST"', 'on_premise'), {
+            'object_type': 'FUNC', 'object_name': 'BAPI_EMPLOYEE_GETLIST', 'system_type': 'on_premise',
+        })
+        self.assertEqual(tool_arguments('sap_search_objects', 'BAPI_EMPLOYEE_GETLIST', 'on_premise'), {
+            'query': 'BAPI_EMPLOYEE_GETLIST', 'system_type': 'on_premise',
         })
 
     def test_validation_before_network(self):
@@ -207,19 +219,25 @@ class ToolTests(unittest.TestCase):
         ):
             with self.subTest(tool=tool), self.assertRaises(ExplorerError):
                 anyio.run(invoke_tool, tool, text)
+        with self.assertRaises(ExplorerError):
+            tool_arguments('sap_get_object_details', 'FUNC, BAPI_EMPLOYEE_GETLIST', 'invalid')
+        with self.assertRaises(ExplorerError):
+            tool_arguments('sap_get_object_details', 'FUNC, BAPI_EMPLOYEE_GETLIST', [])
 
     def test_search_dispatch_preserves_cascade(self):
         with patch('mcp_engine.search', new=AsyncMock(return_value={'tool': 'search'})) as mocked:
             self.assertEqual(anyio.run(invoke_tool, 'search', '@search topic', 7), {'tool': 'search'})
-            mocked.assert_awaited_once_with('@search topic', 7)
+            mocked.assert_awaited_once_with('@search topic', 7, 'sap-cloud', None)
 
     def test_non_search_calls_and_exports(self):
         cases = (
             ('fetch', '/library/doc_id', {'id': '/library/doc_id'}),
             ('abap_lint', 'REPORT z_demo.\nWRITE \'@search\'.\n', {'code': 'REPORT z_demo.\nWRITE \'@search\'.\n'}),
             ('sap_community_search', 'SELECT performance', {'query': 'SELECT performance'}),
-            ('sap_search_objects', 'CL_ABAP_REGEX', {'query': 'CL_ABAP_REGEX'}),
-            ('sap_get_object_details', 'CLAS, CL_ABAP_REGEX', {'object_type': 'CLAS', 'object_name': 'CL_ABAP_REGEX'}),
+            ('sap_search_objects', 'CL_ABAP_REGEX', {'query': 'CL_ABAP_REGEX', 'system_type': 'public_cloud'}),
+            ('sap_get_object_details', 'CLAS, CL_ABAP_REGEX', {
+                'object_type': 'CLAS', 'object_name': 'CL_ABAP_REGEX', 'system_type': 'public_cloud',
+            }),
             ('abap_feature_matrix', 'inline declaration', {'query': 'inline declaration'}),
             ('abap_feature_matrix', '', {'query': ''}),
             ('sap_discovery_center_search', 'SAP Build', {'query': 'SAP Build'}),
@@ -228,12 +246,11 @@ class ToolTests(unittest.TestCase):
         result = CallToolResult(content=[TextContent(type='text', text='SAP tool response\nDettagli del risultato.')])
         for tool, text, expected in cases:
             call_tool = AsyncMock(return_value=result)
-
-            @asynccontextmanager
-            async def session():
-                yield SimpleNamespace(call_tool=call_tool)
-
-            with self.subTest(tool=tool), patch('mcp_engine.connected_session', session):
+            provider = SimpleNamespace(
+                server_id='sap-cloud', endpoint='https://example.test/mcp', allow_dynamic_tools=False,
+                execute_tool=call_tool,
+            )
+            with self.subTest(tool=tool), patch('mcp_engine.create_provider', return_value=provider):
                 snapshot = anyio.run(invoke_tool, tool, text, 9)
                 call_tool.assert_awaited_once_with(name=tool, arguments=expected)
                 self.assertEqual(snapshot['tool'], tool)
@@ -245,14 +262,227 @@ class ToolTests(unittest.TestCase):
                         self.assertTrue(Path(exported['path']).is_file())
                         self.assertTrue(exported['mime_type'])
 
-    def test_tool_error_reports_selected_name(self):
-        @asynccontextmanager
-        async def session():
-            yield SimpleNamespace(call_tool=AsyncMock(return_value=CallToolResult(
-                content=[TextContent(type='text', text='ID sconosciuto')], isError=True,
-            )))
+    def test_on_premise_tool_is_discovered_and_schema_validated(self):
+        tool = SimpleNamespace(inputSchema={
+            'type': 'object', 'properties': {'table_name': {'type': 'string'}},
+            'required': ['table_name'], 'additionalProperties': False,
+        })
+        result = CallToolResult(content=[TextContent(type='text', text='Metadati runtime SAP')])
+        provider = SimpleNamespace(
+            server_id='sap-on-premise', allow_dynamic_tools=True,
+            discover_tools=AsyncMock(return_value={'adt_get_table': tool}),
+            execute_tool=AsyncMock(return_value=result),
+        )
+        with patch('mcp_engine.create_provider', return_value=provider):
+            snapshot = anyio.run(
+                invoke_tool, 'adt_get_table', '{"table_name":"T000"}', 3,
+                'public_cloud', 'sap-on-premise',
+            )
+            self.assertEqual(snapshot['arguments'], {'table_name': 'T000'})
+            provider.execute_tool.assert_awaited_once_with(name='adt_get_table', arguments={'table_name': 'T000'})
+            with self.assertRaisesRegex(ExplorerError, 'schema'):
+                anyio.run(invoke_tool, 'adt_get_table', '{"wrong":"T000"}', 3, 'public_cloud', 'sap-on-premise')
+            with self.assertRaisesRegex(ExplorerError, 'non e disponibile'):
+                anyio.run(invoke_tool, 'sap_get_object_details', '{}', 3, 'public_cloud', 'sap-on-premise')
 
-        with patch('mcp_engine.connected_session', session):
+
+class ProviderTests(unittest.TestCase):
+    def test_adt_config_uses_package_environment_contract(self):
+        on_premise = mcp_providers._load_config()['servers']['sap-on-premise']
+        self.assertEqual(set(on_premise['env']), {
+            'SAP_URL', 'SAP_USERNAME', 'SAP_PASSWORD', 'SAP_CLIENT', 'SAP_SYSNR', 'SAP_SYSTEM_ID',
+        })
+        self.assertNotIn('SAP_ASHOST', on_premise['env'])
+        self.assertNotIn('SAP_USER', on_premise['env'])
+
+    def test_provider_factory_uses_external_config_and_environment(self):
+        with patch.dict(os.environ, {
+            'SAP_URL': 'https://sap.internal', 'SAP_CLIENT': '100',
+            'SAP_USERNAME': 'runtime-user', 'SAP_PASSWORD': 'runtime-secret',
+        }):
+            cloud = mcp_providers.create_provider('sap-cloud')
+            on_premise = mcp_providers.create_provider('sap-on-premise', {
+                'SAP_URL': 'https://vhsrqds4ci.sap.campania.local', 'SAP_CLIENT': '100',
+                'SAP_SYSNR': '00', 'SAP_SYSTEM_ID': 'DS4',
+                'SAP_USERNAME': 'BCECCARELLI', 'SAP_PASSWORD': 'temporary-test-password',
+            })
+        self.assertIsInstance(cloud, mcp_providers.CloudMcpProvider)
+        self.assertEqual(cloud.endpoint, mcp_providers.resolve_value('${SAP_CLOUD_MCP_ENDPOINT:-https://mcp-abap.marianzeis.de/mcp}'))
+        self.assertIsInstance(on_premise, mcp_providers.OnPremiseMcpProvider)
+        self.assertEqual(on_premise.env['SAP_URL'], 'https://vhsrqds4ci.sap.campania.local')
+        self.assertEqual(on_premise.env['SAP_SYSNR'], '00')
+        self.assertEqual(on_premise.env['SAP_SYSTEM_ID'], 'DS4')
+        self.assertEqual(on_premise.env['SAP_CLIENT'], '100')
+        self.assertEqual(on_premise.env['SAP_USERNAME'], 'BCECCARELLI')
+        self.assertEqual(on_premise.env['SAP_PASSWORD'], 'temporary-test-password')
+
+    def test_provider_factory_rejects_missing_or_hardcoded_secrets(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(mcp_providers.McpProviderError, 'SAP_USERNAME'):
+                mcp_providers.create_provider('sap-on-premise')
+        with patch('mcp_providers._load_config', return_value={
+            'servers': {'bad': {
+                'label': 'bad', 'transport': 'stdio', 'command': 'npx',
+                'env': {'SAP_PASSWORD': 'do-not-store-this'},
+            }},
+        }):
+            with self.assertRaisesRegex(mcp_providers.McpProviderError, 'variabile di ambiente'):
+                mcp_providers.create_provider('bad')
+        with patch('mcp_providers._load_config', return_value={
+            'servers': {'bad': {
+                'label': 'bad', 'transport': 'stdio', 'command': 'npx',
+                'env': {'SAP_PASSWORD': '${SAP_PASSWORD:-hardcoded-fallback}'},
+            }},
+        }):
+            with self.assertRaisesRegex(mcp_providers.McpProviderError, 'senza fallback'):
+                mcp_providers.create_provider('bad')
+
+    def test_stdio_error_output_redacts_credentials(self):
+        writer = mcp_providers.SafeErrorWriter(['runtime-secret'])
+        self.assertGreaterEqual(writer.fileno(), 0)
+        os.write(writer.fileno(), b'ADT login failed for runtime-secret')
+        writer.close()
+        self.assertEqual(writer.message(), 'ADT login failed for [REDACTED]')
+
+
+class DiagnosticsTests(unittest.TestCase):
+    def run_diagnostics(
+        self, http_status=200, tools=('read_table', 'get_class'),
+        ssl_failure=False, startup_error=None, discovery_error=None,
+        host_unreachable=False, connect_timeout=False,
+    ):
+        requests = []
+        async def handle(request):
+            requests.append(request)
+            if ssl_failure:
+                raise httpx.ConnectError('TLS handshake failed', request=request) from ssl.SSLError('certificate verify failed')
+            if connect_timeout:
+                raise httpx.ConnectTimeout('connect timed out', request=request)
+            return httpx.Response(http_status, request=request)
+
+        @asynccontextmanager
+        async def connect():
+            if startup_error:
+                raise mcp_providers.McpProviderError(startup_error)
+            if discovery_error:
+                session = SimpleNamespace(list_tools=AsyncMock(side_effect=RuntimeError(discovery_error)))
+            else:
+                session = SimpleNamespace(list_tools=AsyncMock(return_value=SimpleNamespace(
+                    tools=[SimpleNamespace(name=name) for name in tools], nextCursor=None,
+                )))
+            yield session
+
+        provider = SimpleNamespace(connect=connect)
+        def factory(server_id, options):
+            self.assertEqual(server_id, 'sap-on-premise')
+            self.assertEqual(options['SAP_USERNAME'], 'BCECCARELLI')
+            self.assertEqual(options['SAP_PASSWORD'], 'temporary-secret')
+            self.assertEqual(options['SAP_SYSNR'], '00')
+            self.assertEqual(options['SAP_SYSTEM_ID'], 'DS4')
+            return provider
+
+        def client_factory(**kwargs):
+            return httpx.AsyncClient(transport=httpx.MockTransport(handle), **kwargs)
+
+        connection_options = {
+            'SAP_URL': 'https://sap.example.local', 'SAP_USERNAME': 'BCECCARELLI',
+            'SAP_PASSWORD': 'temporary-secret', 'SAP_CLIENT': '100',
+            'SAP_SYSNR': '00', 'SAP_SYSTEM_ID': 'DS4',
+        }
+
+        async def execute():
+            with patch('sap_diagnostics._check_network', new=AsyncMock(return_value=(
+                {'status': 'OK', 'addressesFound': 1},
+                {'status': 'ERROR', 'error': 'TimeoutError'} if host_unreachable else {'status': 'OK'},
+            ))):
+                report = await sap_diagnostics.diagnose_sap_onpremise(
+                    connection_options, factory, client_factory,
+                )
+                return report
+        report = anyio.run(execute)
+        return report, requests
+
+    def test_http_status_classification_and_tools(self):
+        with self.assertLogs('mcp.diagnostics', level='INFO') as captured:
+            report, requests = self.run_diagnostics(200)
+        self.assertEqual(report['adt']['status'], 'OK')
+        self.assertEqual(report['authentication']['status'], 'OK')
+        self.assertEqual(report['adtPermissions']['status'], 'OK')
+        self.assertEqual(report['toolDiscovery']['tools'], ['get_class', 'read_table'])
+        self.assertEqual(report['toolsFound'], 2)
+        self.assertEqual(requests[0].url.path, '/sap/bc/adt')
+        self.assertEqual(requests[0].url.params['sap-client'], '100')
+        self.assertNotIn('temporary-secret', json.dumps(report))
+        self.assertNotIn('BCECCARELLI', json.dumps(report))
+        self.assertNotIn('temporary-secret', '\n'.join(captured.output))
+        self.assertNotIn('BCECCARELLI', '\n'.join(captured.output))
+        self.assertEqual(self.run_diagnostics(401)[0]['authentication']['status'], 'ERROR')
+        forbidden = self.run_diagnostics(403)[0]
+        self.assertEqual(forbidden['adtPermissions']['status'], 'ERROR')
+        missing = self.run_diagnostics(404)[0]
+        self.assertEqual(missing['adt']['status'], 'NOT_FOUND')
+        self.assertTrue(any('Attivare' in text for text in missing['suggestions']))
+        no_tools = self.run_diagnostics(200, tools=())[0]
+        self.assertEqual(no_tools['mcpStartup']['status'], 'OK')
+        self.assertEqual(no_tools['toolDiscovery']['status'], 'ERROR')
+
+    def test_mcp_discovery_success_with_unreachable_sap_is_partial(self):
+        tool_names = tuple(f'tool_{index}' for index in range(16))
+        report, _ = self.run_diagnostics(
+            tools=tool_names, host_unreachable=True, connect_timeout=True,
+        )
+        self.assertEqual(report['mcpStartup']['status'], 'OK')
+        self.assertEqual(report['toolDiscovery']['status'], 'OK')
+        self.assertEqual(report['toolsFound'], 16)
+        self.assertEqual(report['adt']['status'], 'UNREACHABLE')
+        self.assertEqual(report['summary'], 'PARTIAL')
+        self.assertIn('MCP operativo', report['summaryMessage'])
+
+    def test_ssl_and_mcp_startup_discovery_failures(self):
+        ssl_report = self.run_diagnostics(ssl_failure=True)[0]
+        self.assertEqual(ssl_report['adt']['status'], 'SSL_ERROR')
+        startup_report = self.run_diagnostics(startup_error='npx missing')[0]
+        self.assertEqual(startup_report['mcpStartup']['status'], 'ERROR')
+        self.assertEqual(startup_report['toolDiscovery']['status'], 'ERROR')
+        discovery_report = self.run_diagnostics(discovery_error='list_tools failed')[0]
+        self.assertEqual(discovery_report['mcpStartup']['status'], 'OK')
+        self.assertEqual(discovery_report['toolDiscovery']['status'], 'ERROR')
+
+    def test_missing_env_skips_network_and_mcp(self):
+        async def execute():
+            return await sap_diagnostics.diagnose_sap_onpremise({
+                'SAP_URL': 'https://sap.example.local', 'SAP_CLIENT': '100',
+            })
+        report = anyio.run(execute)
+        self.assertEqual(report['environment']['status'], 'ERROR')
+        self.assertEqual(report['authentication']['status'], 'SKIPPED')
+        self.assertEqual(report['toolDiscovery']['status'], 'SKIPPED')
+
+    def test_http_url_is_rejected_before_network_or_mcp(self):
+        options = {
+            'SAP_URL': 'http://sap.example.local', 'SAP_USERNAME': 'BCECCARELLI',
+            'SAP_PASSWORD': 'temporary-secret', 'SAP_CLIENT': '100',
+        }
+        factory = AsyncMock()
+        async def execute():
+            with patch('sap_diagnostics._check_network', new=AsyncMock()) as network:
+                report = await sap_diagnostics.diagnose_sap_onpremise(options, factory)
+                network.assert_not_awaited()
+                return report
+        report = anyio.run(execute)
+        factory.assert_not_awaited()
+        self.assertEqual(report['adt']['status'], 'INSECURE_URL')
+        self.assertEqual(report['mcpStartup']['status'], 'SKIPPED')
+        self.assertNotIn('temporary-secret', json.dumps(report))
+
+    def test_tool_error_reports_selected_name(self):
+        provider = SimpleNamespace(
+            server_id='sap-cloud', endpoint='https://example.test/mcp', allow_dynamic_tools=False,
+            execute_tool=AsyncMock(return_value=CallToolResult(
+                content=[TextContent(type='text', text='ID sconosciuto')], isError=True,
+            )),
+        )
+        with patch('mcp_engine.create_provider', return_value=provider):
             with self.assertRaisesRegex(ExplorerError, 'Errore del tool fetch: ID sconosciuto'):
                 anyio.run(invoke_tool, 'fetch', '/missing')
 
@@ -286,6 +516,20 @@ class LocalLLMTests(unittest.TestCase):
             with self.assertRaises(ExplorerError):
                 llm_engine.validate_call(name, arguments, catalog)
 
+    def test_dynamic_tool_schema_is_authoritative(self):
+        catalog = {'adt_get_table': SimpleNamespace(inputSchema={
+            'type': 'object', 'properties': {'table_name': {'type': 'string'}},
+            'required': ['table_name'], 'additionalProperties': True,
+        })}
+        llm_engine.validate_call(
+            'adt_get_table', {'table_name': 'T000', 'language': 'E'}, catalog,
+            strict_properties=False,
+        )
+        with self.assertRaises(ExplorerError):
+            llm_engine.validate_call(
+                'adt_get_table', {'table_name': 12}, catalog, strict_properties=False,
+            )
+
     def test_compact_schema_preserves_constraints(self):
         original = {
             'type': 'object', 'description': 'Long documentation',
@@ -299,15 +543,21 @@ class LocalLLMTests(unittest.TestCase):
         self.assertEqual(compact['properties']['kind']['enum'], ['A', 'B'])
         self.assertEqual(compact['required'], ['kind'])
 
-    def run_agent(self, replies):
-        catalog = {'fetch': SimpleNamespace(name='fetch', description='Read document', inputSchema={
+    def run_agent(self, replies, server_id='sap-cloud', dynamic=False):
+        tool_name = 'adt_get_table' if dynamic else 'fetch'
+        input_schema = {
+            'type': 'object', 'properties': {'table_name': {'type': 'string'}}, 'required': ['table_name'],
+        } if dynamic else {
             'type': 'object', 'properties': {'id': {'type': 'string'}}, 'required': ['id'],
-        })}
+        }
+        catalog = {tool_name: SimpleNamespace(name=tool_name, description='Read SAP object', inputSchema=input_schema)}
         call_tool = AsyncMock(return_value=CallToolResult(content=[TextContent(type='text', text='Documento SAP completo')]))
 
-        @asynccontextmanager
-        async def session():
-            yield SimpleNamespace(call_tool=call_tool)
+        provider = SimpleNamespace(
+            server_id=server_id, endpoint='https://example.test/mcp' if not dynamic else None,
+            allow_dynamic_tools=dynamic,
+            execute_tool=call_tool,
+        )
 
         chat = iter(replies)
         requests = []
@@ -319,8 +569,9 @@ class LocalLLMTests(unittest.TestCase):
         factory = httpx.AsyncClient
         with patch('llm_engine.httpx.AsyncClient', side_effect=lambda **kwargs: factory(**kwargs, transport=httpx.MockTransport(handle))):
             with patch('llm_engine.local_model_catalog', new=AsyncMock(return_value=[{'name': 'local', 'capabilities': ['completion', 'tools']}])):
-                with patch('llm_engine.mcp_catalog', new=AsyncMock(return_value=catalog)), patch('llm_engine.connected_session', session):
-                    snapshot = anyio.run(llm_engine.run_local_llm, 'local', 'Leggi /doc')
+                with patch('llm_engine.mcp_catalog', new=AsyncMock(return_value=catalog)), \
+                    patch('llm_engine.create_provider', return_value=provider):
+                    snapshot = anyio.run(llm_engine.run_local_llm, 'local', 'Leggi /doc', server_id)
         return snapshot, call_tool, requests
 
     def test_agent_calls_mcp_and_summarizes_with_exports(self):
@@ -336,6 +587,18 @@ class LocalLLMTests(unittest.TestCase):
         self.assertIn('Documento SAP completo', requests[1]['messages'][-1]['content'])
         for extension in ('json', 'txt', 'md'):
             self.assertTrue(format_response(snapshot, extension))
+
+    def test_on_premise_llm_uses_only_live_server_tools(self):
+        snapshot, call, requests = self.run_agent([
+            {'content': '', 'tool_calls': [{'function': {
+                'name': 'adt_get_table', 'arguments': {'table_name': 'T000'},
+            }}]},
+            {'content': 'Tabella verificata dal sistema SAP.'},
+        ], server_id='sap-on-premise', dynamic=True)
+        call.assert_awaited_once_with(name='adt_get_table', arguments={'table_name': 'T000'})
+        self.assertEqual(snapshot['server_id'], 'sap-on-premise')
+        self.assertIn('unica fonte di verita', requests[0]['messages'][0]['content'])
+        self.assertEqual(requests[0]['tools'][0]['function']['name'], 'adt_get_table')
 
     def test_repeated_calls_and_missing_tool_calls_are_rejected(self):
         call = {'content': '', 'tool_calls': [{'function': {'name': 'fetch', 'arguments': {'id': '/doc'}}}]}
@@ -398,6 +661,56 @@ class HTTPTests(unittest.TestCase):
         self.assertTrue(json.loads(payload)['ready'])
         self.assertEqual(self.request('/api/health', host='evil.example')[0], 403)
 
+    def test_server_and_tool_catalog_endpoints(self):
+        servers = {'servers': [
+            {'id': 'sap-cloud', 'label': 'SAP Cloud'},
+            {'id': 'sap-on-premise', 'label': 'SAP On-Premise'},
+        ], 'default_server': 'sap-cloud'}
+        catalog = {'server_id': 'sap-on-premise', 'dynamic_arguments': True, 'tools': [{'name': 'adt_table'}]}
+        with patch('app.list_servers', return_value=servers):
+            status, payload = self.request('/api/servers')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), servers)
+        with patch('app.list_server_tools', new=AsyncMock(return_value=catalog)) as mocked:
+            status, payload = self.request('/api/tools?server_id=sap-on-premise')
+            mocked.assert_awaited_once_with('sap-on-premise', app.PROVIDER_FACTORY)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), catalog)
+        with patch('app.list_server_tools', new=AsyncMock(side_effect=ExplorerError('ADT offline'))):
+            status, payload = self.request('/api/tools?server_id=sap-on-premise')
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(payload)['error'], 'ADT offline')
+        options = {
+            'SAP_URL': 'https://sap.example.local', 'SAP_CLIENT': '100',
+            'SAP_SYSNR': '00', 'SAP_SYSTEM_ID': 'DS4',
+        }
+        with patch('app.PROVIDER_FACTORY', return_value=SimpleNamespace(env=options)) as factory:
+            with patch('app.list_server_tools', new=AsyncMock(return_value=catalog)) as mocked:
+                status, payload = self.request('/api/tools', {
+                    'server_id': 'sap-on-premise', 'connection_options': options,
+                })
+                args = mocked.await_args.args
+                simulated_provider = args[1]('sap-on-premise')
+                factory.assert_called_once_with('sap-on-premise', options)
+        self.assertEqual(status, 200)
+        self.assertEqual(args[0], 'sap-on-premise')
+        self.assertEqual(simulated_provider.env['SAP_URL'], options['SAP_URL'])
+        self.assertEqual(simulated_provider.env['SAP_SYSNR'], options['SAP_SYSNR'])
+        self.assertEqual(simulated_provider.env['SAP_SYSTEM_ID'], options['SAP_SYSTEM_ID'])
+
+    def test_diagnostics_endpoint_returns_safe_report(self):
+        report = {'summary': 'OK', 'authentication': {'status': 'OK'}, 'toolsFound': 4}
+        options = {
+            'SAP_URL': 'https://sap.example.local', 'SAP_USERNAME': 'BCECCARELLI',
+            'SAP_PASSWORD': 'temporary-secret', 'SAP_CLIENT': '100',
+            'SAP_SYSNR': '00', 'SAP_SYSTEM_ID': 'DS4',
+        }
+        with patch('app.diagnose_sap_onpremise', new=AsyncMock(return_value=report)) as mocked:
+            status, payload = self.request('/api/diagnostics', {'connection_options': options})
+            mocked.assert_awaited_once_with(options, app.PROVIDER_FACTORY)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), report)
+        self.assertNotIn('temporary-secret', payload.decode())
     def test_token_and_invalid_inputs(self):
         for token in ('', 'invalid', '\u00e9'):
             self.assertEqual(self.request('/api/search', {'query': 'ABAP'}, token=token)[0], 403)
@@ -414,7 +727,7 @@ class HTTPTests(unittest.TestCase):
         }
         with patch('app.invoke_tool', new=AsyncMock(return_value=snapshot)) as mocked:
             status, payload = self.request('/api/search', {'query': 'SELECT', 'count': 3})
-            mocked.assert_awaited_once_with('search', 'SELECT', 3)
+            mocked.assert_awaited_once_with('search', 'SELECT', 3, 'public_cloud', None, app.PROVIDER_FACTORY)
         self.assertEqual(status, 200)
         result = json.loads(payload)
         self.assertEqual(result['search_log'], snapshot['search_log'])
@@ -453,9 +766,25 @@ class HTTPTests(unittest.TestCase):
             with self.subTest(tool=tool), patch('app.invoke_tool', new=AsyncMock(return_value=snapshot)) as mocked:
                 status, payload = self.request('/api/invoke', {'tool': tool, 'text': text})
                 self.assertEqual(status, 200)
-                mocked.assert_awaited_once_with(tool, text, 3)
+                mocked.assert_awaited_once_with(tool, text, 3, 'public_cloud', None, app.PROVIDER_FACTORY)
                 self.assertEqual(json.loads(payload)['tool'], tool)
                 self.assertEqual(json.loads(payload)['arguments'], snapshot['arguments'])
+        snapshot = {
+            'tool': 'sap_get_object_details', 'query': 'FUNC, BAPI_EMPLOYEE_GETLIST',
+            'arguments': tool_arguments('sap_get_object_details', 'FUNC, BAPI_EMPLOYEE_GETLIST', 'on_premise'),
+            'raw_text': 'Risposta SAP', 'response': {}, 'created_at': '2026-10-19T12:00:00+00:00',
+        }
+        with patch('app.invoke_tool', new=AsyncMock(return_value=snapshot)) as mocked:
+            status, payload = self.request('/api/invoke', {
+                'tool': 'sap_get_object_details', 'text': 'FUNC, BAPI_EMPLOYEE_GETLIST',
+                'system_type': 'on_premise', 'server_id': 'sap-on-premise',
+            })
+            self.assertEqual(status, 200)
+            mocked.assert_awaited_once_with(
+                'sap_get_object_details', 'FUNC, BAPI_EMPLOYEE_GETLIST', 3, 'on_premise',
+                'sap-on-premise', app.PROVIDER_FACTORY,
+            )
+            self.assertEqual(json.loads(payload)['tool'], 'sap_get_object_details')
         self.assertEqual(self.request('/api/invoke', {'tool': 'unknown', 'text': 'SAP'})[0], 400)
 
     def test_llm_api_and_model_catalog(self):
@@ -472,7 +801,7 @@ class HTTPTests(unittest.TestCase):
         with patch('app.run_local_llm', new=AsyncMock(return_value=snapshot)) as mocked:
             status, payload = self.request('/api/invoke', {'mode': 'llm', 'model': 'local', 'text': 'Richiesta'})
             self.assertEqual(status, 200)
-            mocked.assert_awaited_once_with('local', 'Richiesta')
+            mocked.assert_awaited_once_with('local', 'Richiesta', None, app.PROVIDER_FACTORY)
             self.assertEqual(json.loads(payload)['mcp_raw_text'], 'Dati MCP')
         self.assertEqual(self.request('/api/invoke', {'mode': 'unknown', 'text': 'Richiesta'})[0], 400)
 

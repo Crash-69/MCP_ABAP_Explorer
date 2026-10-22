@@ -17,11 +17,17 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import anyio
 
-from mcp_engine import ENDPOINT, ExplorerError, detector, export_response, invoke_tool
+from mcp_engine import (
+    ENDPOINT, ExplorerError, detector, export_response, invoke_tool,
+    list_server_tools, list_servers,
+)
 from llm_engine import list_local_models, run_local_llm
+from mcp_providers import create_provider
+from sap_diagnostics import diagnose_sap_onpremise
 
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN = secrets.token_urlsafe(32)
@@ -30,6 +36,7 @@ RESULT_LOCK = threading.Lock()
 SEARCH_LOCK = threading.Lock()
 DOWNLOADS: dict[str, str] = {}
 MIME_TYPES = {'json': 'application/json', 'txt': 'text/plain', 'md': 'text/markdown'}
+PROVIDER_FACTORY = create_provider
 
 
 def store_result(snapshot: dict) -> str:
@@ -92,6 +99,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
         if self.path == '/api/health':
             return self.reply(200, {'ready': True, 'endpoint': ENDPOINT, 'port': self.server.server_port})
+        if self.path == '/api/servers':
+            try:
+                return self.reply(200, list_servers())
+            except ExplorerError as error:
+                return self.reply(503, {'error': str(error)})
+        if self.path == '/api/tools' or self.path.startswith('/api/tools?'):
+            try:
+                query = parse_qs(urlsplit(self.path).query)
+                server_id = query.get('server_id', [None])[0]
+                return self.reply(200, anyio.run(list_server_tools, server_id, PROVIDER_FACTORY))
+            except ExplorerError as error:
+                return self.reply(503, {'error': str(error)})
         if self.path == '/api/models':
             try:
                 return self.reply(200, {'provider': 'Ollama locale', 'models': anyio.run(list_local_models)})
@@ -135,22 +154,48 @@ class Handler(BaseHTTPRequestHandler):
         supplied_token = self.headers.get('X-App-Token', '').encode('utf-8')
         if not self.trusted_host() or not secrets.compare_digest(supplied_token, TOKEN.encode('ascii')):
             return self.reply(403, {'error': 'Richiesta non autorizzata. Ricarica la pagina.'})
-        if self.path not in {'/api/invoke', '/api/search', '/api/export'}:
+        if self.path not in {'/api/invoke', '/api/search', '/api/export', '/api/tools', '/api/diagnostics'}:
             return self.reply(404, {'error': 'Risorsa non trovata.'})
         acquired = False
         try:
             data = self.read_json()
+            if self.path == '/api/diagnostics':
+                acquired = SEARCH_LOCK.acquire(blocking=False)
+                if not acquired:
+                    return self.reply(429, {'error': 'Una richiesta MCP e gia in corso. Attendi il completamento.'})
+                options = data.get('connection_options')
+                if not isinstance(options, dict):
+                    raise ExplorerError('Parametri di connessione SAP mancanti.')
+                report = anyio.run(diagnose_sap_onpremise, options, PROVIDER_FACTORY)
+                return self.reply(200, report)
+            if self.path == '/api/tools':
+                acquired = SEARCH_LOCK.acquire(blocking=False)
+                if not acquired:
+                    return self.reply(429, {'error': 'Una richiesta MCP e gia in corso. Attendi il completamento.'})
+                server_id = data.get('server_id')
+                connection_options = data.get('connection_options')
+                provider_factory = PROVIDER_FACTORY
+                if connection_options is not None:
+                    provider_factory = lambda selected_id: PROVIDER_FACTORY(selected_id, connection_options)
+                snapshot = anyio.run(list_server_tools, server_id, provider_factory)
+                return self.reply(200, snapshot)
             if self.path in {'/api/invoke', '/api/search'}:
                 acquired = SEARCH_LOCK.acquire(blocking=False)
                 if not acquired:
                     return self.reply(429, {'error': 'Una richiesta MCP e gia in corso. Attendi il completamento.'})
                 mode = data.get('mode', 'python')
+                server_id = data.get('server_id')
+                connection_options = data.get('connection_options')
+                provider_factory = PROVIDER_FACTORY
+                if connection_options is not None:
+                    provider_factory = lambda selected_id: PROVIDER_FACTORY(selected_id, connection_options)
                 if mode == 'llm':
-                    snapshot = anyio.run(run_local_llm, data.get('model'), data.get('text'))
+                    snapshot = anyio.run(run_local_llm, data.get('model'), data.get('text'), server_id, provider_factory)
                 elif mode == 'python':
                     snapshot = anyio.run(
                         invoke_tool, data.get('tool', 'search'),
                         data.get('text', data.get('query')), data.get('count', 3),
+                        data.get('system_type', 'public_cloud'), server_id, provider_factory,
                     )
                 else:
                     raise ExplorerError('Modalita non supportata. Scegli Python oppure Ollama locale.')
@@ -161,6 +206,7 @@ class Handler(BaseHTTPRequestHandler):
                     'query': snapshot['query'], 'optimized_query': snapshot.get('optimized_query', snapshot['query']),
                     'attempts': snapshot.get('attempts', []), 'search_log': snapshot.get('search_log', []),
                     'mode': snapshot.get('mode', 'python'), 'model': snapshot.get('model'),
+                    'server_id': snapshot.get('server_id', server_id or 'sap-cloud'),
                     'mcp_raw_text': snapshot.get('mcp_raw_text', ''),
                 })
             result_id = data.get('result_id')
@@ -197,6 +243,7 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error('La porta deve essere compresa tra 1 e 65535.')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
     try:
         detector()
         server = LocalServer(('127.0.0.1', args.port), Handler)

@@ -21,7 +21,31 @@ URL: **http://127.0.0.1:8036**. Il browser viene aperto automaticamente; `--no-b
 
 ## Client MCP
 
-L'endpoint operativo e **https://mcp-abap.marianzeis.de/mcp**, non la homepage `https://marianzeis.de`. Il client usa Streamable HTTP e inizializzazione MCP. In modalita Python non vengono usati LLM, Ollama o API key. La modalita LLM usa esclusivamente Ollama locale. Gli argomenti dei tool, incluso l'eventuale codice da analizzare, vengono inviati al server MCP remoto: non inserire dati aziendali riservati.
+La configurazione server e in `mcp_servers.json`. Il default retrocompatibile e `sap-cloud`, con endpoint `https://mcp-abap.marianzeis.de/mcp` su Streamable HTTP. `sap-on-premise` avvia `npx -y mcp-abap-adt` su stdio; la selezione SAP nell'interfaccia viene mantenuta nel browser. Trasporto, discovery ed esecuzione sono isolati dietro `IMcpProvider` e `create_provider()` in `mcp_providers.py`.
+
+Per la connessione On-Premise, `SAP_URL` e `SAP_CLIENT` sono modificabili nella UI e hanno default non segreti in `mcp_servers.json`. `SAP_USERNAME` e password vengono richiesti per ogni discovery o interrogazione; la password e mascherata, non usa autocomplete, non viene salvata in session/browser storage ed e svuotata al termine della richiesta. I valori viaggiano solo nel POST locale protetto da token e sono passati al processo ADT tramite le variabili richieste dal package (`SAP_URL`, `SAP_USERNAME`, `SAP_PASSWORD`, `SAP_CLIENT`). Il backend li redige da stderr e risposte MCP prima di conservarli. Per automazioni senza UI si possono impostare le stesse variabili nell'ambiente del processo. In PowerShell si puo ottenere l'utente/password senza inserirli nella cronologia dei comandi:
+
+```powershell
+$sapCredential = Get-Credential
+$env:SAP_URL = 'https://host-sap'
+$env:SAP_CLIENT = '100'
+$env:SAP_USERNAME = $sapCredential.UserName
+$env:SAP_PASSWORD = $sapCredential.GetNetworkCredential().Password
+& '.\.venv\Scripts\python.exe' '.\app.py'
+Remove-Variable sapCredential
+```
+
+Le credenziali UI sono effimere e non vengono scritte in file, browser storage o log. Non inserire segreti nel JSON di configurazione o in file versionati. Il template `.env.example` documenta i nomi, ma non viene caricato automaticamente. Per un MCP ADT diverso, modificare `command`, `args` e `env` in `mcp_servers.json`; il protocollo deve essere stdio.
+
+La sezione **SAP On-Premise Diagnostics** esegue, su richiesta, check delle quattro env, DNS/TCP, `GET /sap/bc/adt` con il parametro `sap-client`, classificazione HTTP (200/401/403/404/SSL), avvio MCP stdio e `list_tools`. Distingue errori di startup da errori di discovery e mostra nomi/count tool, stato autenticazione, permessi e suggerimenti. **Scarica report JSON** esporta solo esiti e dettagli sanitizzati, mai username/password. Il check 200 conferma l'accesso all'endpoint; non certifica i permessi per ogni operazione ADT.
+
+I campi UI **Numero istanza** e **ID sistema** vengono inviati al processo `npx` come `SAP_SYSNR` e `SAP_SYSTEM_ID`, insieme a `SAP_URL`, `SAP_USERNAME`, `SAP_PASSWORD` e `SAP_CLIENT`. La documentazione npm corrente di `mcp-abap-adt` non elenca `SAP_SYSNR`/`SAP_SYSTEM_ID`: l'app li inoltra nell'ambiente del processo, ma il package potrebbe ignorarli. Sono inclusi per server/versioni che li supportano.
+
+Il Cloud mantiene i nove tool compatibili esistenti. Per On-Premise, nomi e schemi sono letti dal server SAP selezionato a ogni caricamento della lista e prima delle chiamate LLM; l'input manuale e validato con lo schema runtime originale. In modalita On-Premise l'LLM usa il server selezionato come fonte runtime e non la whitelist Cloud. Se un server e offline, l'errore resta visibile e si puo cambiare server senza riavviare la sessione.
+
+Per compatibilita, `/api/invoke` e `/api/search` senza `server_id` continuano a selezionare `sap-cloud`; `MCP_DEFAULT_SERVER` puo cambiare il default. `SAP_CLOUD_MCP_ENDPOINT` e `MCP_SERVERS_CONFIG` consentono override tramite ambiente.
+
+In modalita Python non vengono usati LLM, Ollama o API key. La modalita LLM usa esclusivamente Ollama locale. Gli argomenti dei tool, incluso l'eventuale codice da analizzare, vengono inviati al server MCP selezionato: non inserire dati aziendali riservati se la configurazione non e approvata.
 
 Timeout: 15 secondi per connettersi, 60 per la risposta MCP, 90 complessivi. Una richiesta alla volta. L'anteprima si aggiorna al completamento del tool, non token per token.
 
@@ -29,7 +53,7 @@ Timeout: 15 secondi per connettersi, 60 per la risposta MCP, 90 complessivi. Una
 
 Il controllo Modalita di esecuzione permette di scegliere:
 
-- **Python diretto** (predefinito): selezione manuale dei nove tool, input dinamico e comportamento precedente. Funziona anche con Ollama spento.
+- **Python diretto** (predefinito): selezione manuale dei tool; in Cloud conserva i nove tool e il formato precedente, in On-Premise carica i tool ADT disponibili e i relativi schemi. Funziona anche con Ollama spento.
 - **Ollama locale**: richiesta discorsiva, scelta del modello e orchestrazione automatica dei tool MCP. Non usa LM Studio, provider cloud o endpoint LLM esterni.
 
 Ollama deve essere gia in esecuzione su **http://127.0.0.1:11434**. Il menu viene ricavato da `/api/tags` e `/api/show`: mostra solo modelli installati con capability `completion` e `tools`. Esclude modelli di embedding, modelli senza tool-calling e quelli con metadati remoti o suffisso `:cloud`. Il catalogo viene ricontrollato prima di ogni inferenza; nessun modello viene scaricato automaticamente. Il pulsante con icona di aggiornamento rilegge il catalogo. Il supporto dichiarato dal runtime non garantisce precisione o prestazioni del singolo modello; modelli grandi o eseguiti su CPU possono andare in timeout.
@@ -57,16 +81,16 @@ I nove nomi tecnici e i parametri sono stati verificati tramite `list_tools` sul
 | `abap_lint` | Codice ABAP | `code` |
 | `abap_feature_matrix` | Funzionalita, anche vuoto per tutte | `query` |
 | `sap_community_search` | Ricerca nella community | `query` |
-| `sap_search_objects` | Nome oggetto o argomento, facoltativo | `query` |
-| `sap_get_object_details` | Tipo e nome separati da virgola | `object_type`, `object_name` |
+| `sap_search_objects` | Nome oggetto o argomento, facoltativo | `query`, `system_type` |
+| `sap_get_object_details` | Tipo e nome separati da virgola | `object_type`, `object_name`, `system_type` |
 | `sap_discovery_center_search` | Nome servizio BTP o argomento | `query` |
 | `sap_discovery_center_service` | UUID o nome di servizio | `serviceId` |
 
-Per i dettagli oggetto, una stringa come `CLAS, CL_ABAP_REGEX` viene suddivisa sui due parametri, eliminando soltanto gli spazi esterni. Valori mancanti o virgole aggiuntive sono rifiutati. Gli esempi non sono valori preimpostati: gli argomenti provengono sempre dall'input.
+Per i dettagli oggetto, una stringa come `CLAS, CL_ABAP_REGEX` viene suddivisa sui due parametri; le virgolette esterne sul nome vengono rimosse. Valori mancanti o virgole aggiuntive sono rifiutati. Per ricerca e dettaglio oggetti si puo selezionare il sistema SAP; il default resta `public_cloud`. Un oggetto classico puo risultare `found: false` nel Public Cloud e risultare presente come `classicAPI` in On-Premise.
 
 Limiti: 4000 caratteri per gli input testuali, **50 KB UTF-8** per il codice di `abap_lint`. Il codice mantiene spazi, a capo, virgolette e tag letterali, senza sanificazione. Anche ID e nomi oggetto non vengono riscritti. Gli input di ricerca dovrebbero essere in inglese, come indicato dal server; non viene effettuata una traduzione automatica.
 
-Le opzioni non esposte usano i default del server (per esempio versione Cloud del lint, sistema public_cloud e filtri Clean Core della ricerca oggetti, valuta USD e pricing/roadmap per i servizi). Il controllo del numero di risultati e visibile solo per `search`, dove viene inviato come `k`. Per `abap_feature_matrix` e `sap_search_objects` e possibile inviare input vuoto.
+Le opzioni non esposte usano i default del server (per esempio versione Cloud del lint, filtri Clean Core della ricerca oggetti, valuta USD e pricing/roadmap per i servizi). Il sistema di destinazione per ricerca e dettaglio oggetti e selezionabile nell'interfaccia; il default e `public_cloud`. Il controllo del numero di risultati e visibile solo per `search`, dove viene inviato come `k`. Per `abap_feature_matrix` e `sap_search_objects` e possibile inviare input vuoto.
 
 Cambiare strumento invalida il risultato precedente; ogni tool conserva una bozza del proprio input finche la pagina resta aperta. L'API UI e `POST /api/invoke` con `tool`, `text` ed eventualmente `count`. `POST /api/search` resta compatibile con i precedenti client (`query`, `count`).
 
@@ -107,7 +131,20 @@ Il server ascolta solo su loopback; le POST richiedono token di sessione e Host 
 
 Estratte il 19 ottobre 2026 da `LAUNCHER_DASHBOARD/launcher_dashboard.py`:
 
-
+| Applicazione | Porta |
+| --- | --- |
+| Inlay Studio | 3002 |
+| Jarvis2 | 8008 |
+| SecureVault | 8011 |
+| Estrattore PDF AI | 8020 |
+| Diagnostics Uniemens | 8021 |
+| Monitoraggio Estrazione CF | 8022 |
+| Word in Markdown | 8027 |
+| Compila Word | 8030 |
+| TxtToObsidian | 8035 |
+| Trascrizioni YouTube | 8501 |
+| Word in Mermaid | 8502 |
+| Launcher Dashboard | 8040-8049 riservate |
 
 Verifica Cedolino e desktop senza porta HTTP. Inlay puo ridefinire porta/URL tramite metadata locale. L'API runtime del launcher su 8040 non ha risposto entro 5 secondi: la tabella descrive le porte configurate, non garantisce quelle runtime di Inlay. Il controllo TCP tra 8000 e 8999 ha rilevato listener su 8040 e 8053. **8036** era libera e non registrata ed e la porta assegnata a questa app.
 

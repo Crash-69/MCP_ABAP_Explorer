@@ -14,9 +14,12 @@ from uuid import uuid4
 
 import anyio
 import httpx
+from jsonschema import Draft202012Validator
 from magika import Magika
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+from mcp_providers import McpProviderError, available_servers, create_provider, default_server_id
+from typing import Callable
+
+ProviderFactory = Callable[[str | None], object]
 
 ENDPOINT = 'https://mcp-abap.marianzeis.de/mcp'
 MAX_CONTENT = 5 * 1024 * 1024
@@ -107,21 +110,44 @@ def result_quality(result) -> tuple[float, int]:
 
 
 @asynccontextmanager
-async def connected_session():
-    with anyio.fail_after(90):
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(60, connect=15), follow_redirects=True,
-        ) as client:
-            async with streamable_http_client(ENDPOINT, http_client=client) as streams:
-                async with ClientSession(
-                    streams[0], streams[1],
-                    read_timeout_seconds=timedelta(seconds=60),
-                ) as session:
-                    await session.initialize()
-                    yield session
+async def connected_session(server_id: str | None = None, provider_factory: ProviderFactory | None = None):
+    provider = (provider_factory or create_provider)(server_id)
+    async with provider.connect() as session:
+        yield session
 
 
-def tool_arguments(tool_name: str, text: str) -> dict:
+def list_servers() -> dict:
+    try:
+        return {'servers': available_servers(), 'default_server': default_server_id()}
+    except McpProviderError as error:
+        raise ExplorerError(str(error)) from error
+
+
+async def list_server_tools(server_id: str | None = None, provider_factory: ProviderFactory | None = None) -> dict:
+    try:
+        provider = (provider_factory or create_provider)(server_id)
+        tools = await provider.discover_tools()
+    except McpProviderError as error:
+        raise ExplorerError(str(error)) from error
+    except Exception as error:
+        label = getattr(locals().get('provider'), 'label', 'selezionato')
+        raise ExplorerError(f'Impossibile ottenere i tool dal server {label}.') from error
+    if not provider.allow_dynamic_tools:
+        tools = {name: tool for name, tool in tools.items() if name in TOOLS}
+    return {
+        'server_id': provider.server_id,
+        'dynamic_arguments': provider.allow_dynamic_tools,
+        'tools': [
+            {
+                'name': name, 'label': TOOLS.get(name, name),
+                'description': tool.description or '', 'inputSchema': tool.inputSchema,
+            }
+            for name, tool in tools.items()
+        ],
+    }
+
+
+def tool_arguments(tool_name: str, text: str, system_type: str = 'public_cloud') -> dict:
     if not isinstance(tool_name, str) or tool_name not in TOOLS:
         raise ExplorerError('Strumento MCP non supportato.')
     if not isinstance(text, str):
@@ -134,6 +160,13 @@ def tool_arguments(tool_name: str, text: str) -> dict:
         return {'code': text}
     if len(text) > 4000:
         raise ExplorerError('Inserisci al massimo 4000 caratteri.')
+    if tool_name in {'sap_search_objects', 'sap_get_object_details'}:
+        if not isinstance(system_type, str) or system_type not in {
+            'public_cloud', 'btp', 'private_cloud', 'on_premise',
+        }:
+            raise ExplorerError('Sistema SAP non supportato.')
+    else:
+        system_type = None
     if tool_name == 'fetch':
         return {'id': text.strip()}
     if tool_name == 'sap_discovery_center_service':
@@ -142,23 +175,62 @@ def tool_arguments(tool_name: str, text: str) -> dict:
         parts = [part.strip() for part in text.split(',')]
         if len(parts) != 2 or not all(parts):
             raise ExplorerError('Inserisci object_type, object_name separati da una sola virgola.')
-        return {'object_type': parts[0], 'object_name': parts[1]}
+        quote_pairs = {'"': '"', "'": "'", '\u201c': '\u201d', '\u00ab': '\u00bb', '\u2018': '\u2019'}
+        object_type, object_name = parts
+        for opening, closing in quote_pairs.items():
+            if object_name.startswith(opening) and object_name.endswith(closing):
+                object_name = object_name[len(opening):-len(closing)].strip()
+                break
+        return {'object_type': object_type, 'object_name': object_name, 'system_type': system_type}
+    if tool_name == 'sap_search_objects':
+        return {'query': text.strip(), 'system_type': system_type}
     return {'query': text.strip()}
 
 
-async def invoke_tool(tool_name: str, text: str, count: int = 3) -> dict:
-    arguments = tool_arguments(tool_name, text)
-    if tool_name == 'search':
-        return await search(text, count)
+async def invoke_tool(
+    tool_name: str, text: str, count: int = 3,
+    system_type: str = 'public_cloud', server_id: str | None = None,
+    provider_factory: ProviderFactory | None = None,
+) -> dict:
     try:
-        async with connected_session() as session:
-            result = await session.call_tool(name=tool_name, arguments=arguments)
+        provider = (provider_factory or create_provider)(server_id)
+        dynamic_arguments = provider.allow_dynamic_tools
+        if dynamic_arguments:
+            catalog = await provider.discover_tools()
+            tool = catalog.get(tool_name)
+            if tool is None:
+                raise ExplorerError('Il tool selezionato non e disponibile sul server MCP scelto.')
+            if not isinstance(text, str) or len(text.encode('utf-8')) > 320 * 1024:
+                raise ExplorerError('Gli argomenti MCP devono essere testuali e non superare 320 KB UTF-8.')
+            try:
+                arguments = json.loads(text) if text.strip() else {}
+            except (json.JSONDecodeError, TypeError) as error:
+                raise ExplorerError('Per i tool On-Premise inserisci gli argomenti come oggetto JSON.') from error
+            if (
+                not isinstance(arguments, dict)
+                or len(json.dumps(arguments, ensure_ascii=False).encode('utf-8')) > 320 * 1024
+                or not Draft202012Validator(tool.inputSchema).is_valid(arguments)
+            ):
+                raise ExplorerError('Gli argomenti non rispettano lo schema MCP del tool selezionato.')
+        else:
+            arguments = tool_arguments(tool_name, text, system_type)
+    except McpProviderError as error:
+        raise ExplorerError(str(error)) from error
+    except ExplorerError:
+        raise
+    except Exception as error:
+        raise ExplorerError('Impossibile scoprire o validare i tool del server MCP selezionato.') from error
+    if tool_name == 'search' and not dynamic_arguments:
+        return await search(text, count, provider.server_id, provider_factory)
+    try:
+        result = await provider.execute_tool(name=tool_name, arguments=arguments)
         raw = '\n\n'.join(item.text for item in result.content if item.type == 'text')
         if result.isError:
             raise ExplorerError(f'Errore del tool {tool_name}: ' + (raw[:2000] or 'nessun dettaglio.'))
         snapshot = {
             'tool': tool_name, 'arguments': arguments, 'query': text,
-            'original_query': text, 'endpoint': ENDPOINT,
+            'original_query': text, 'endpoint': getattr(provider, 'endpoint', f'stdio:{provider.server_id}'),
+            'server_id': provider.server_id,
             'created_at': datetime.now(timezone.utc).isoformat(),
             'raw_text': raw, 'response': result.model_dump(mode='json'),
             'attempts': [], 'search_log': [f'Strumento invocato: {tool_name}'],
@@ -171,10 +243,15 @@ async def invoke_tool(tool_name: str, text: str, count: int = 3) -> dict:
     except TimeoutError as error:
         raise ExplorerError('Tempo massimo di attesa superato. Riprova tra poco.') from error
     except Exception as error:
+        if isinstance(error, McpProviderError):
+            raise ExplorerError(str(error)) from error
         raise ExplorerError(f'Chiamata MCP {tool_name} non riuscita. Verifica rete e disponibilita del server.') from error
 
 
-async def search(query: str, count: int = 3) -> dict:
+async def search(
+    query: str, count: int = 3, server_id: str | None = None,
+    provider_factory: ProviderFactory | None = None,
+) -> dict:
     if not isinstance(query, str) or not query.strip() or len(query) > 4000:
         raise ExplorerError('Inserisci una ricerca da 1 a 4000 caratteri.')
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 20:
@@ -187,7 +264,7 @@ async def search(query: str, count: int = 3) -> dict:
     selected_query = optimized_query
     search_log = [f'Query ottimizzata in: {optimized_query}']
     try:
-        async with connected_session() as session:
+        async with connected_session(server_id, provider_factory) as session:
             for candidate in query_candidates(optimized_query):
                 result = await session.call_tool(name='search', arguments={'query': candidate, 'k': count})
                 raw = '\n\n'.join(item.text for item in result.content if item.type == 'text')
@@ -218,7 +295,11 @@ async def search(query: str, count: int = 3) -> dict:
             'query': selected_query, 'original_query': original_query,
             'optimized_query': optimized_query, 'attempts': attempts,
             'search_log': search_log, 'score_threshold': MIN_SCORE,
-            'count': count, 'endpoint': ENDPOINT,
+            'count': count, 'endpoint': getattr(
+                (provider_factory or create_provider)(server_id), 'endpoint',
+                f'stdio:{server_id or default_server_id()}',
+            ),
+            'server_id': server_id or default_server_id(),
             'created_at': datetime.now(timezone.utc).isoformat(),
             'raw_text': raw, 'response': result.model_dump(mode='json'),
         }
@@ -230,6 +311,8 @@ async def search(query: str, count: int = 3) -> dict:
     except TimeoutError as error:
         raise ExplorerError('Tempo massimo di attesa superato. Riprova tra poco.') from error
     except Exception as error:
+        if isinstance(error, McpProviderError):
+            raise ExplorerError(str(error)) from error
         raise ExplorerError('Connessione MCP non riuscita. Verifica rete e disponibilita del server.') from error
 
 
