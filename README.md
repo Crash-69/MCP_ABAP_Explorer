@@ -131,26 +131,7 @@ I file UTF-8 vengono salvati nella cartella dell'app con nome univoco `mcp_abap_
 
 Il server ascolta solo su loopback; le POST richiedono token di sessione e Host locale. Il testo remoto non viene interpretato come HTML. I download sono limitati ai file esportati nella sessione corrente.
 
-## Porte Del Launcher
 
-Estratte il 19 ottobre 2026 da `LAUNCHER_DASHBOARD/launcher_dashboard.py`:
-
-| Applicazione | Porta |
-| --- | --- |
-| Inlay Studio | 3002 |
-| Jarvis2 | 8008 |
-| SecureVault | 8011 |
-| Estrattore PDF AI | 8020 |
-| Diagnostics Uniemens | 8021 |
-| Monitoraggio Estrazione CF | 8022 |
-| Word in Markdown | 8027 |
-| Compila Word | 8030 |
-| TxtToObsidian | 8035 |
-| Trascrizioni YouTube | 8501 |
-| Word in Mermaid | 8502 |
-| Launcher Dashboard | 8040-8049 riservate |
-
-Verifica Cedolino e desktop senza porta HTTP. Inlay puo ridefinire porta/URL tramite metadata locale. L'API runtime del launcher su 8040 non ha risposto entro 5 secondi: la tabella descrive le porte configurate, non garantisce quelle runtime di Inlay. Il controllo TCP tra 8000 e 8999 ha rilevato listener su 8040 e 8053. **8036** era libera e non registrata ed e la porta assegnata a questa app.
 
 L'app e ora registrata nel Launcher Dashboard con ID `mcp-abap-explorer`, categoria Sviluppo e automazione e porta **8036**. La scheda usa lo stile standard delle altre applicazioni e l'interprete della `.venv` locale. Il launcher passa `--port 8036 --no-browser`, apre la pagina appena pronta e riutilizza l'istanza esistente soltanto se riconosce il titolo HTML dell'app. I processi avviati esternamente non vengono terminati dal launcher.
 
