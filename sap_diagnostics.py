@@ -17,6 +17,8 @@ from mcp_providers import McpProviderError, create_provider
 
 LOGGER = logging.getLogger('mcp.diagnostics')
 REQUIRED_ENV = ('SAP_URL', 'SAP_USERNAME', 'SAP_PASSWORD', 'SAP_CLIENT')
+ADT_ROOT_PATH = '/sap/bc/adt'
+ADT_DISCOVERY_PATH = ADT_ROOT_PATH + '/discovery'
 
 
 def _check(status: str, details: dict | None = None) -> dict:
@@ -69,10 +71,10 @@ def _suggestions(report: dict) -> list[str]:
     if report['network']['dns']['status'] == 'ERROR':
         suggestions.append('Verificare DNS, VPN e risoluzione del nome host SAP.')
     if report['network']['hostReachable']['status'] == 'ERROR':
-        suggestions.append('Verificare rete, firewall e porta HTTPS del sistema SAP.')
+        suggestions.append('Verificare rete, firewall e porta HTTP(S) del sistema SAP.')
     adt_status = report['adt']['status']
     if adt_status == 'NOT_FOUND':
-        suggestions.append('Attivare il servizio SAP ADT su /sap/bc/adt.')
+        suggestions.append('Attivare il servizio SAP ADT su /sap/bc/adt/discovery.')
     elif adt_status == 'FORBIDDEN':
         suggestions.append('Verificare autorizzazioni SAP per ADT e accesso HTTP.')
     elif adt_status == 'SSL_ERROR':
@@ -84,11 +86,11 @@ def _suggestions(report: dict) -> list[str]:
     if report['authentication']['status'] == 'ERROR':
         suggestions.append('Verificare USER e password SAP; non inserirli nei log o nei file di configurazione.')
     if report['mcpStartup']['status'] == 'ERROR':
-        suggestions.append('Verificare Node.js, npx, accesso al registry e stderr del server MCP.')
+        suggestions.append('Verificare percorso e permessi di abap-mcp-windows.exe e stderr del server MCP.')
     if report['adtPermissions']['status'] == 'ERROR':
         suggestions.append('Verificare i ruoli e le autorizzazioni ADT dell’utente SAP.')
     if report['toolDiscovery']['status'] == 'ERROR':
-        suggestions.append('Verificare la versione di mcp-abap-adt e la disponibilita dell’endpoint ADT.')
+        suggestions.append('Verificare la versione di abap-mcp e la disponibilita dell’endpoint ADT.')
     return list(dict.fromkeys(suggestions))
 
 
@@ -149,27 +151,17 @@ async def diagnose_sap_onpremise(
 
     try:
         parsed_url = urlsplit(values['SAP_URL'].strip())
-        if parsed_url.scheme == 'http':
-            report['adt'] = {
-                'status': 'INSECURE_URL', 'endpoint': None, 'httpStatus': None,
-                'error': 'HTTPS obbligatorio: credenziali non inviate su HTTP.',
-            }
-            report['network']['status'] = 'SKIPPED'
-            report['authentication'] = {'status': 'SKIPPED', 'message': 'Credenziali non inviate su HTTP.'}
-            report['adtPermissions'] = {'status': 'SKIPPED', 'message': None}
-            report['mcpStartup'] = {'status': 'SKIPPED', 'error': 'URL non sicuro; startup non eseguito.'}
-            report['toolDiscovery'] = {
-                'status': 'SKIPPED', 'toolsFound': 0, 'tools': [],
-                'error': 'URL non sicuro; discovery non eseguita.',
-            }
-            report['summary'] = 'ERROR'
-            report['suggestions'] = _suggestions(report)
-            return report
-        if parsed_url.scheme != 'https' or not parsed_url.hostname or parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
+        if parsed_url.scheme not in {'http', 'https'} or not parsed_url.hostname or parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
             raise ValueError('SAP_URL deve essere un URL HTTP(S) senza credenziali.')
         port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
         base_url = values['SAP_URL'].strip().rstrip('/')
-        adt_endpoint = base_url if parsed_url.path.rstrip('/').endswith('/sap/bc/adt') else base_url + '/sap/bc/adt'
+        url_path = parsed_url.path.rstrip('/')
+        if url_path.endswith(ADT_DISCOVERY_PATH):
+            adt_endpoint = base_url
+        elif url_path.endswith(ADT_ROOT_PATH):
+            adt_endpoint = base_url + '/discovery'
+        else:
+            adt_endpoint = base_url + ADT_DISCOVERY_PATH
     except ValueError as error:
         report['adt'] = {'status': 'UNREACHABLE', 'endpoint': None, 'httpStatus': None, 'error': str(error)}
         report['network']['status'] = 'ERROR'
@@ -197,6 +189,7 @@ async def diagnose_sap_onpremise(
                 response = await client.get(
                     adt_endpoint,
                     params={'sap-client': values['SAP_CLIENT']},
+                    headers={'Accept': 'application/atomsvc+xml'},
                     auth=httpx.BasicAuth(values['SAP_USERNAME'], values['SAP_PASSWORD']),
                 )
         code = response.status_code
@@ -287,4 +280,6 @@ async def diagnose_sap_onpremise(
 
     report['summary'], report['summaryMessage'] = _overall(report)
     report['suggestions'] = _suggestions(report)
+    if parsed_url.scheme == 'http':
+        report['suggestions'].append('HTTP non cifra credenziali e dati SAP: usare solo su rete fidata; preferire HTTPS.')
     return report

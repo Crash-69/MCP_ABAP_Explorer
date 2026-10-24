@@ -291,6 +291,13 @@ class ProviderTests(unittest.TestCase):
         on_premise = mcp_providers._load_config()['servers']['sap-on-premise']
         self.assertEqual(set(on_premise['env']), {
             'SAP_URL', 'SAP_USERNAME', 'SAP_PASSWORD', 'SAP_CLIENT', 'SAP_SYSNR', 'SAP_SYSTEM_ID',
+            'SAP_LANGUAGE', 'TLS_REJECT_UNAUTHORIZED',
+        })
+        self.assertEqual(on_premise['command'], r'c:\Users\IT05020\.vscode\extensions\harieprasad.abap-mcp-2.0.0\bin\abap-mcp-windows.exe')
+        self.assertEqual(on_premise['args'], ['-y', 'abap-mcp'])
+        self.assertEqual(on_premise['connection_defaults'], {
+            'SAP_URL': 'http://172.20.253.162:8000', 'SAP_SYSNR': '00',
+            'SAP_SYSTEM_ID': 'S4B', 'SAP_CLIENT': '800',
         })
         self.assertNotIn('SAP_ASHOST', on_premise['env'])
         self.assertNotIn('SAP_USER', on_premise['env'])
@@ -315,6 +322,67 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(on_premise.env['SAP_CLIENT'], '100')
         self.assertEqual(on_premise.env['SAP_USERNAME'], 'BCECCARELLI')
         self.assertEqual(on_premise.env['SAP_PASSWORD'], 'temporary-test-password')
+        self.assertEqual(on_premise.env['SAP_LANGUAGE'], 'IT')
+        self.assertEqual(on_premise.env['TLS_REJECT_UNAUTHORIZED'], '0')
+
+    def test_dynamic_stdio_parameters_initialize_and_close_per_request(self):
+        events = []
+        parameters = []
+        session = SimpleNamespace(
+            initialize=AsyncMock(),
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[], nextCursor=None)),
+        )
+
+        @asynccontextmanager
+        async def stdio(params, **kwargs):
+            parameters.append(params)
+            events.append('spawn')
+            try:
+                yield ('reader', 'writer')
+            finally:
+                events.append('close')
+
+        @asynccontextmanager
+        async def client_session(*args, **kwargs):
+            yield session
+
+        async def discover():
+            for suffix in ('first', 'second'):
+                provider = mcp_providers.create_provider('sap-on-premise', {
+                    'SAP_URL': f'http://{suffix}.internal:8000',
+                    'SAP_CLIENT': '800', 'SAP_SYSNR': '00', 'SAP_SYSTEM_ID': 'TST',
+                    'SAP_USERNAME': f'{suffix}-user', 'SAP_PASSWORD': f'{suffix}-password',
+                })
+                await provider.discover_tools()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch('mcp_providers.stdio_client', side_effect=stdio):
+                with patch('mcp_providers.ClientSession', side_effect=client_session):
+                    anyio.run(discover)
+        self.assertEqual(events, ['spawn', 'close', 'spawn', 'close'])
+        self.assertEqual(session.initialize.await_count, 2)
+        for params, suffix in zip(parameters, ('first', 'second')):
+            self.assertEqual(params.args, ['-y', 'abap-mcp'])
+            self.assertTrue(params.command.endswith('abap-mcp-windows.exe'))
+            self.assertEqual(params.env['SAP_URL'], f'http://{suffix}.internal:8000')
+            self.assertEqual(params.env['SAP_USERNAME'], f'{suffix}-user')
+            self.assertEqual(params.env['SAP_PASSWORD'], f'{suffix}-password')
+            self.assertEqual(params.env['SAP_CLIENT'], '800')
+            self.assertEqual(params.env['SAP_LANGUAGE'], 'IT')
+            self.assertEqual(params.env['TLS_REJECT_UNAUTHORIZED'], '0')
+
+    def test_invalid_connection_options_and_urls_are_rejected(self):
+        for options in ([], 'invalid', 42):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(mcp_providers.McpProviderError, 'oggetto'):
+                    mcp_providers.create_provider('sap-on-premise', options)
+        for url in ('ftp://sap.internal', 'http://user:secret@sap.internal',
+                    'http://sap.internal?password=secret', 'http://sap.internal:invalid'):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(mcp_providers.McpProviderError, 'SAP_URL'):
+                    mcp_providers.create_provider('sap-on-premise', {
+                        'SAP_URL': url, 'SAP_USERNAME': 'test-user', 'SAP_PASSWORD': 'test-secret',
+                    })
 
     def test_provider_factory_rejects_missing_or_hardcoded_secrets(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -350,6 +418,7 @@ class DiagnosticsTests(unittest.TestCase):
         self, http_status=200, tools=('read_table', 'get_class'),
         ssl_failure=False, startup_error=None, discovery_error=None,
         host_unreachable=False, connect_timeout=False,
+        sap_url='https://sap.example.local',
     ):
         requests = []
         async def handle(request):
@@ -385,7 +454,7 @@ class DiagnosticsTests(unittest.TestCase):
             return httpx.AsyncClient(transport=httpx.MockTransport(handle), **kwargs)
 
         connection_options = {
-            'SAP_URL': 'https://sap.example.local', 'SAP_USERNAME': 'BCECCARELLI',
+            'SAP_URL': sap_url, 'SAP_USERNAME': 'BCECCARELLI',
             'SAP_PASSWORD': 'temporary-secret', 'SAP_CLIENT': '100',
             'SAP_SYSNR': '00', 'SAP_SYSTEM_ID': 'DS4',
         }
@@ -410,7 +479,8 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(report['adtPermissions']['status'], 'OK')
         self.assertEqual(report['toolDiscovery']['tools'], ['get_class', 'read_table'])
         self.assertEqual(report['toolsFound'], 2)
-        self.assertEqual(requests[0].url.path, '/sap/bc/adt')
+        self.assertEqual(requests[0].url.path, '/sap/bc/adt/discovery')
+        self.assertEqual(requests[0].headers['Accept'], 'application/atomsvc+xml')
         self.assertEqual(requests[0].url.params['sap-client'], '100')
         self.assertNotIn('temporary-secret', json.dumps(report))
         self.assertNotIn('BCECCARELLI', json.dumps(report))
@@ -458,21 +528,12 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(report['authentication']['status'], 'SKIPPED')
         self.assertEqual(report['toolDiscovery']['status'], 'SKIPPED')
 
-    def test_http_url_is_rejected_before_network_or_mcp(self):
-        options = {
-            'SAP_URL': 'http://sap.example.local', 'SAP_USERNAME': 'BCECCARELLI',
-            'SAP_PASSWORD': 'temporary-secret', 'SAP_CLIENT': '100',
-        }
-        factory = AsyncMock()
-        async def execute():
-            with patch('sap_diagnostics._check_network', new=AsyncMock()) as network:
-                report = await sap_diagnostics.diagnose_sap_onpremise(options, factory)
-                network.assert_not_awaited()
-                return report
-        report = anyio.run(execute)
-        factory.assert_not_awaited()
-        self.assertEqual(report['adt']['status'], 'INSECURE_URL')
-        self.assertEqual(report['mcpStartup']['status'], 'SKIPPED')
+    def test_http_url_supports_diagnostics_with_explicit_warning(self):
+        report, requests = self.run_diagnostics(sap_url='http://sap.example.local:8000')
+        self.assertEqual(str(requests[0].url), 'http://sap.example.local:8000/sap/bc/adt/discovery?sap-client=100')
+        self.assertEqual(report['adt']['status'], 'OK')
+        self.assertEqual(report['mcpStartup']['status'], 'OK')
+        self.assertTrue(any('HTTP non cifra' in text for text in report['suggestions']))
         self.assertNotIn('temporary-secret', json.dumps(report))
 
     def test_tool_error_reports_selected_name(self):

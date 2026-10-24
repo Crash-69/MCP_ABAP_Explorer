@@ -133,13 +133,12 @@ get('tool').addEventListener('change', () => {
 });
 get('server').addEventListener('change', async () => {
   drafts.set(draftKey(), get('query').value);
-  clearUiCredentials();
   activeServer = get('server').value;
   try { sessionStorage.setItem('mcp-server-id', activeServer); } catch {}
   invalidate();
   configureServerConnection();
-  if (activeServer === 'sap-cloud') await loadServerTools();
-  else prepareOnPremiseSelection();
+  if (isOnPremise()) prepareOnPremiseSelection();
+  else await loadServerTools();
 });
 document.querySelectorAll('input[name="mode"]').forEach(input => input.addEventListener('change', () => {
   drafts.set(draftKey(), get('query').value);
@@ -156,7 +155,7 @@ get('run-diagnostics').addEventListener('click', runDiagnostics);
 get('download-diagnostics').addEventListener('click', downloadDiagnostics);
 
 function isOnPremise() {
-  return serverDefinitions.find(server => server.id === activeServer)?.transport === 'stdio';
+  return activeServer === 'sap-on-premise';
 }
 
 function connectionOptions(includeCredentials = true) {
@@ -178,6 +177,11 @@ function clearUiCredentials() {
   get('adt-password').value = '';
 }
 
+window.addEventListener('pagehide', clearUiCredentials);
+window.addEventListener('pageshow', event => {
+  if (event.persisted) clearUiCredentials();
+});
+
 function configureServerConnection() {
   const onPremise = isOnPremise();
   get('adt-connection').hidden = !onPremise;
@@ -185,7 +189,7 @@ function configureServerConnection() {
   if (!onPremise) return;
   const defaults = serverDefinitions.find(server => server.id === activeServer)?.connection_defaults || {};
   let saved = {};
-  try { saved = JSON.parse(sessionStorage.getItem(`mcp-connection-${activeServer}`) || '{}'); } catch {}
+  try { saved = JSON.parse(sessionStorage.getItem(`mcp-connection-v2-${activeServer}`) || '{}'); } catch {}
   get('adt-url').value = saved.SAP_URL || defaults.SAP_URL || '';
   get('adt-sysnr').value = saved.SAP_SYSNR || defaults.SAP_SYSNR || '';
   get('adt-system-id').value = saved.SAP_SYSTEM_ID || defaults.SAP_SYSTEM_ID || '';
@@ -210,6 +214,14 @@ function prepareOnPremiseSelection() {
   controls();
 }
 
+['adt-url', 'adt-sysnr', 'adt-system-id', 'adt-client'].forEach(id => {
+  get(id).addEventListener('input', () => {
+    if (!isOnPremise()) return;
+    invalidate();
+    prepareOnPremiseSelection();
+  });
+});
+
 async function loadServerTools(connectOnPremise = false) {
   const onPremise = isOnPremise();
   if (onPremise && !connectOnPremise) return prepareOnPremiseSelection();
@@ -223,14 +235,13 @@ async function loadServerTools(connectOnPremise = false) {
       if (!options.SAP_USERNAME || !options.SAP_PASSWORD) {
         throw new Error('Inserire USER e password SAP prima di aggiornare i tool ADT.');
       }
-      try { sessionStorage.setItem(`mcp-connection-${activeServer}`, JSON.stringify(connectionOptions(false))); } catch {}
+      try { sessionStorage.setItem(`mcp-connection-v2-${activeServer}`, JSON.stringify(connectionOptions(false))); } catch {}
       get('adt-status').textContent = 'Avvio server ADT e lettura tool SAP...';
       try {
         data = await post('/api/tools', {server_id: activeServer, connection_options: options});
       } finally {
         options.SAP_USERNAME = '';
         options.SAP_PASSWORD = '';
-        clearUiCredentials();
       }
     } else {
       const response = await fetch(`/api/tools?server_id=${encodeURIComponent(activeServer)}`, {
@@ -248,7 +259,7 @@ async function loadServerTools(connectOnPremise = false) {
     get('tool').value = activeTool;
     toolsReady = true;
     configureInput();
-    if (onPremise) get('adt-status').textContent = `${serverTools.length} tool ADT disponibili. Reinserire USER e password per ogni richiesta.`;
+    if (onPremise) get('adt-status').textContent = `${serverTools.length} tool ADT disponibili. Credenziali mantenute fino alla chiusura o al ricaricamento della pagina.`;
     showError('');
   } catch (error) {
     serverTools = [];
@@ -379,7 +390,6 @@ async function runDiagnostics() {
   } finally {
     options.SAP_USERNAME = '';
     options.SAP_PASSWORD = '';
-    clearUiCredentials();
     get('run-diagnostics').disabled = false;
   }
 }
@@ -437,7 +447,6 @@ get('search-form').addEventListener('submit', async event => {
   } finally {
     busy = false;
     if (isOnPremise()) {
-      clearUiCredentials();
       if (payload.connection_options) {
         payload.connection_options.SAP_USERNAME = '';
         payload.connection_options.SAP_PASSWORD = '';

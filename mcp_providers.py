@@ -130,6 +130,8 @@ class OnPremiseMcpProvider(IMcpProvider):
 
     def __init__(self, server_id: str, config: dict, connection_options: dict | None = None):
         super().__init__(server_id, config['label'])
+        if connection_options is not None and not isinstance(connection_options, dict):
+            raise McpProviderError('Le opzioni di connessione SAP devono essere un oggetto.')
         self.command = config['command']
         self.args = config.get('args', [])
         defaults = config.get('connection_defaults', {})
@@ -236,14 +238,15 @@ def resolve_environment(
             try:
                 parsed_url = urlsplit(value.strip())
                 valid_url = (
-                    parsed_url.scheme == 'https' and parsed_url.hostname
+                    parsed_url.scheme in {'http', 'https'} and parsed_url.hostname
+                    and (parsed_url.port is None or parsed_url.port > 0)
                     and not parsed_url.username and not parsed_url.password
                     and not parsed_url.query and not parsed_url.fragment
                 )
             except ValueError:
                 valid_url = False
             if not valid_url:
-                raise McpProviderError('SAP_URL deve usare HTTPS ed essere valido, senza credenziali o query.')
+                raise McpProviderError('SAP_URL deve usare HTTP o HTTPS ed essere valido, senza credenziali o query.')
         if key == 'SAP_CLIENT' and not re.fullmatch(r'\d{3}', value.strip()):
             raise McpProviderError('Il client SAP deve contenere tre cifre.')
         if key == 'SAP_SYSNR' and not re.fullmatch(r'\d{2}', value.strip()):

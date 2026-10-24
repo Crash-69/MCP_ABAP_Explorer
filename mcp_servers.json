@@ -9,13 +9,13 @@
     "sap-on-premise": {
       "label": "SAP On-Premise",
       "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "mcp-abap-adt"],
+      "command": "c:\\Users\\IT05020\\.vscode\\extensions\\harieprasad.abap-mcp-2.0.0\\bin\\abap-mcp-windows.exe",
+      "args": ["-y", "abap-mcp"],
       "connection_defaults": {
-        "SAP_URL": "https://vhsrqds4ci.sap.campania.local",
+        "SAP_URL": "http://172.20.253.162:8000",
         "SAP_SYSNR": "00",
-        "SAP_SYSTEM_ID": "DS4",
-        "SAP_CLIENT": "100"
+        "SAP_SYSTEM_ID": "S4B",
+        "SAP_CLIENT": "800"
       },
       "env": {
         "SAP_URL": "${SAP_URL}",
@@ -23,7 +23,9 @@
         "SAP_SYSTEM_ID": "${SAP_SYSTEM_ID}",
         "SAP_CLIENT": "${SAP_CLIENT}",
         "SAP_USERNAME": "${SAP_USERNAME}",
-        "SAP_PASSWORD": "${SAP_PASSWORD}"
+        "SAP_PASSWORD": "${SAP_PASSWORD}",
+        "SAP_LANGUAGE": "IT",
+        "TLS_REJECT_UNAUTHORIZED": "0"
       }
     }
   }

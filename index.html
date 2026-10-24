@@ -22,11 +22,13 @@
           <div class="adt-fields">
             <label>URL SAP<input id="adt-url" type="url" maxlength="512" autocomplete="off" placeholder="https://sap.example.local"></label>
             <label>Numero istanza<input id="adt-sysnr" type="text" inputmode="numeric" maxlength="2" autocomplete="off" placeholder="00"></label>
-            <label>ID sistema<input id="adt-system-id" type="text" maxlength="3" autocomplete="off" autocapitalize="characters" placeholder="DS4"></label>
+            <label>ID sistema<input id="adt-system-id" type="text" maxlength="3" autocomplete="off" autocapitalize="characters" placeholder="S4B"></label>
             <label>Client<input id="adt-client" type="text" inputmode="numeric" maxlength="3" autocomplete="off"></label>
             <label>USER SAP<input id="adt-user" type="text" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
             <label>Password<input id="adt-password" type="password" autocomplete="off" spellcheck="false"></label>
           </div>
+          <p>Utenza e password restano solo in memoria fino alla chiusura o al ricaricamento della pagina. Non vengono salvate nel browser.</p>
+          <p>Usare solo su rete fidata: HTTP non cifra credenziali e dati. Il server MCP usa TLS_REJECT_UNAUTHORIZED=0 (verifica certificati disabilitata).</p>
           <button id="refresh-adt-tools" type="button" title="Collega ADT e aggiorna la lista dei tool"><i data-lucide="refresh-cw"></i><span>Aggiorna tool ADT</span></button>
           <span id="adt-status" role="status"></span>
           <section id="sap-diagnostics" class="diagnostics" aria-labelledby="diagnostics-title">
